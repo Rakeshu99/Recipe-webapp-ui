@@ -1,0 +1,54 @@
+name: Frontend - QA
+
+on:
+  push:
+    branches: [qa]
+  pull_request:
+    branches: [qa]
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: SonarQube scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Log in to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: recipeuiacr.azurecr.io
+          username: ${{ secrets.ACR_UI_USERNAME }}
+          password: ${{ secrets.ACR_UI_PASSWORD }}
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t recipeuiacr.azurecr.io/recipe-frontend:qa-${{ github.sha }} .
+          docker push recipeuiacr.azurecr.io/recipe-frontend:qa-${{ github.sha }}
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: recipeuiacr.azurecr.io/recipe-frontend:qa-${{ github.sha }}
+          format: table
+          exit-code: 0
+        env:
+          TRIVY_USERNAME: ${{ secrets.ACR_UI_USERNAME }}
+          TRIVY_PASSWORD: ${{ secrets.ACR_UI_PASSWORD }}
