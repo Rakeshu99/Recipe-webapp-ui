@@ -1,14 +1,63 @@
-name: Frontend - Development
+name: Frontend - Production Deploy (Blue/Green)
 
 on:
   push:
-    branches: [development]
-  pull_request:
-    branches: [development]
+    branches: [main]
 
 jobs:
-  build-and-scan:
+
+  # ── JOB 1: Provision infra with Terraform ─────────────────────────────────
+  provision:
     runs-on: ubuntu-latest
+    outputs:
+      plan_name: ${{ steps.get_plan.outputs.plan_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.0
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+      - name: Terraform Apply (provision infra if not exists)
+        working-directory: terraform
+        run: terraform apply -auto-approve
+        env:
+          ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+
+      - name: Get App Service Plan name
+        id: get_plan
+        run: |
+          PLAN_NAME=$(az webapp show \
+            --name recipe-ui-dev \
+            --resource-group rg-recipe-ui \
+            --query "serverFarmId" -o tsv | xargs basename)
+          echo "plan_name=$PLAN_NAME" >> $GITHUB_OUTPUT
+
+  # ── JOB 2: Build, scan, deploy to staging, smoke test ─────────────────────
+  build-and-stage:
+    runs-on: ubuntu-latest
+    needs: provision
 
     steps:
       - name: Checkout code
@@ -31,10 +80,136 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
-      - name: Trivy filesystem scan
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Log in to ACR via service principal
+        run: az acr login --name recipeuiacr
+
+      - name: Build and push production image
+        run: |
+          docker build -t recipeuiacr.azurecr.io/recipe-frontend:${{ github.sha }} .
+          docker build -t recipeuiacr.azurecr.io/recipe-frontend:latest .
+          docker push recipeuiacr.azurecr.io/recipe-frontend:${{ github.sha }}
+          docker push recipeuiacr.azurecr.io/recipe-frontend:latest
+
+      - name: Trivy image scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          scan-type: fs
-          scan-ref: .
+          image-ref: recipeuiacr.azurecr.io/recipe-frontend:latest
           format: table
           exit-code: 0
+
+      - name: Upgrade to S1 if on B1 (slot support required)
+        run: |
+          PLAN_NAME="${{ needs.provision.outputs.plan_name }}"
+          CURRENT_SKU=$(az appservice plan show \
+            --name $PLAN_NAME \
+            --resource-group rg-recipe-ui \
+            --query "sku.name" -o tsv)
+          echo "Current SKU: $CURRENT_SKU"
+          if [[ "$CURRENT_SKU" == B* ]]; then
+            echo "Upgrading to S1..."
+            az appservice plan update \
+              --name $PLAN_NAME \
+              --resource-group rg-recipe-ui \
+              --sku S1
+            echo "Upgrade complete"
+          else
+            echo "Already on $CURRENT_SKU"
+          fi
+
+      - name: Ensure staging slot exists
+        run: |
+          SLOT_EXISTS=$(az webapp deployment slot list \
+            --name recipe-ui-dev \
+            --resource-group rg-recipe-ui \
+            --query "[?name=='staging'].name" -o tsv)
+          if [ -z "$SLOT_EXISTS" ]; then
+            echo "Creating staging slot..."
+            az webapp deployment slot create \
+              --name recipe-ui-dev \
+              --resource-group rg-recipe-ui \
+              --slot staging
+            az resource update \
+              --ids /subscriptions/${{ secrets.ARM_SUBSCRIPTION_ID }}/resourceGroups/rg-recipe-ui/providers/Microsoft.Web/sites/recipe-ui-dev/slots/staging \
+              --set properties.siteConfig.acrUseManagedIdentityCreds=true
+            az webapp config container set \
+              --name recipe-ui-dev \
+              --resource-group rg-recipe-ui \
+              --slot staging \
+              --container-image-name recipeuiacr.azurecr.io/recipe-frontend:latest \
+              --container-registry-url https://recipeuiacr.azurecr.io
+            az webapp config appsettings set \
+              --name recipe-ui-dev \
+              --resource-group rg-recipe-ui \
+              --slot staging \
+              --settings WEBSITES_PORT=3000 BACKEND_URL=https://recipe-backend-dev.azurewebsites.net
+            echo "Staging slot created"
+          else
+            echo "Staging slot already exists"
+          fi
+
+      - name: Deploy to staging slot (Green)
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: recipe-ui-dev
+          slot-name: staging
+          images: recipeuiacr.azurecr.io/recipe-frontend:${{ github.sha }}
+
+      - name: Smoke test staging slot
+        run: |
+          echo "Waiting for staging slot to warm up..."
+          sleep 40
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+            https://recipe-ui-dev-staging.azurewebsites.net)
+          echo "Staging slot response: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "Smoke test FAILED ($STATUS) — blocking swap"
+            exit 1
+          fi
+          echo "Smoke test PASSED — staging healthy"
+          echo "Staging URL: https://recipe-ui-dev-staging.azurewebsites.net"
+          echo "Waiting for manual approval before swapping to production..."
+
+  # ── JOB 3: Manual approval gate → swap to production ──────────────────────
+  approve-and-swap:
+    runs-on: ubuntu-latest
+    needs: build-and-stage
+    environment: production        # ← This triggers the approval notification
+
+    steps:
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Swap staging to production (Blue/Green)
+        run: |
+          echo "Approval received — swapping staging to production..."
+          az webapp deployment slot swap \
+            --name recipe-ui-dev \
+            --resource-group rg-recipe-ui \
+            --slot staging \
+            --target-slot production
+          echo "Swap complete — new version is live"
+
+      - name: Verify production after swap
+        run: |
+          sleep 15
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 \
+            https://recipe-ui-dev.azurewebsites.net)
+          echo "Production response after swap: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "Production unhealthy — rolling back automatically"
+            az webapp deployment slot swap \
+              --name recipe-ui-dev \
+              --resource-group rg-recipe-ui \
+              --slot staging \
+              --target-slot production
+            echo "Rollback complete — previous version restored"
+            exit 1
+          fi
+          echo "Production healthy — Blue/Green deployment successful"
