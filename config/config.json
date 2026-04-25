@@ -1,9 +1,9 @@
 {
-	"development": {
+    "development": {
         "config_id": "development",
         "app_name": "Recipe Tracker",
-		"webservice_host": "backend", 
-		"webservice_port": "8080", 
-		"exposedPort": "3000"
-	}
+        "webservice_host": "recipe-backend-dev.azurewebsites.net",
+        "webservice_port": "443",
+        "exposedPort": "3000"
+    }
 }
